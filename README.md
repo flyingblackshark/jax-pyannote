@@ -276,6 +276,7 @@ pipeline = SpeakerDiarization(
     backend="flax_nnx",  # or "jax"
     jax_device="cpu",    # optional: "cpu", "gpu", "tpu", "tpu:0", ...
     jax_jit=True,        # optional: disable for debugging
+    jax_data_parallel=True,  # optional: use pmap across local devices (e.g. TPU cores)
     token="HUGGINGFACE_ACCESS_TOKEN",
 )
 
@@ -295,6 +296,7 @@ Notes:
 - The Flax NNX pipeline backend converts PyTorch checkpoints at runtime (first run is slower).
 - For true TPU execution with JAX, you need a TPU-enabled `jaxlib` + `libtpu` runtime.
 - The current WeSpeaker Flax NNX path reuses PyTorch/torchaudio fbank extraction on CPU.
+- When using `jax_data_parallel=True`, set `segmentation_batch_size` / `embedding_batch_size` to multiples of the local device count for best throughput.
 
 Install optional dependencies:
 

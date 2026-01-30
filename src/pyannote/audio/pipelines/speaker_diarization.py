@@ -172,6 +172,9 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         When not set, relies on JAX default device placement.
     jax_jit : bool, optional
         Whether to JIT-compile Flax NNX inference functions. Defaults to True.
+    jax_data_parallel : bool, optional
+        When using the Flax NNX backend, try to use `pmap` (data-parallel) across
+        all local JAX devices (e.g. TPU cores). Defaults to False.
         
     Usage
     -----
@@ -225,6 +228,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         backend: str = "torch",
         jax_device: str | None = None,
         jax_jit: bool = True,
+        jax_data_parallel: bool = False,
     ):
         super().__init__()
 
@@ -235,6 +239,9 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         segmentation_backend = backend
         if isinstance(segmentation, Mapping) and "backend" in segmentation:
             segmentation_backend = str(segmentation.get("backend"))
+        segmentation_dp = jax_data_parallel
+        if isinstance(segmentation, Mapping) and "data_parallel" in segmentation:
+            segmentation_dp = bool(segmentation.get("data_parallel"))
 
         self.segmentation_step = segmentation_step
 
@@ -244,6 +251,9 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         embedding_backend = backend
         if isinstance(embedding, Mapping) and "backend" in embedding:
             embedding_backend = str(embedding.get("backend"))
+        embedding_dp = jax_data_parallel
+        if isinstance(embedding, Mapping) and "data_parallel" in embedding:
+            embedding_dp = bool(embedding.get("data_parallel"))
 
         self.plda = plda
         self._plda = get_plda(plda, token=token, cache_dir=cache_dir)
@@ -253,14 +263,16 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
 
         def _strip_backend(spec: PipelineModel) -> PipelineModel:
-            # Allow users to pass e.g. {"checkpoint": ..., "subfolder": ..., "backend": "flax_nnx"}.
-            if isinstance(spec, Mapping) and "backend" in spec:
-                stripped = dict(spec)
-                stripped.pop("backend", None)
-                stripped.pop("jax_device", None)
-                stripped.pop("jit", None)
-                return stripped
-            return spec
+            # Allow users to pass extra backend-related keys in dict specs.
+            if not isinstance(spec, Mapping):
+                return spec
+
+            stripped = dict(spec)
+            stripped.pop("backend", None)
+            stripped.pop("jax_device", None)
+            stripped.pop("jit", None)
+            stripped.pop("data_parallel", None)
+            return stripped
 
         if segmentation_backend.lower() in ("jax", "flax_nnx"):
             # Load PyTorch checkpoint for metadata + weight conversion.
@@ -296,6 +308,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 powerset_mapping=powerset_mapping,
                 jax_device=jax_device,
                 jit=jax_jit,
+                data_parallel=segmentation_dp,
             )
 
         else:
@@ -342,6 +355,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                     cache_dir=cache_dir,
                     jax_device=jax_device,
                     jit=jax_jit,
+                    data_parallel=embedding_dp,
                 )
             else:
                 self._embedding = PretrainedSpeakerEmbedding(
@@ -482,71 +496,158 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 binary_segmentations.data, binary_segmentations.sliding_window
             )
 
-        def iter_waveform_and_mask():
-            for (chunk, masks), (_, clean_masks) in zip(
-                binary_segmentations, clean_segmentations
-            ):
-                # chunk: Segment(t, t + duration)
-                # masks: (num_frames, local_num_speakers) np.ndarray
-
-                waveform, _ = self._audio.crop(
-                    file,
-                    chunk,
-                    mode="pad",
-                )
-                # waveform: (1, num_samples) torch.Tensor
-
-                # mask may contain NaN (in case of partial stitching)
-                masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
-                clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
-
-                for mask, clean_mask in zip(masks.T, clean_masks.T):
-                    # mask: (num_frames, ) np.ndarray
-
-                    if np.sum(clean_mask) > min_num_frames:
-                        used_mask = clean_mask
-                    else:
-                        used_mask = mask
-
-                    yield waveform[None], torch.from_numpy(used_mask)[None]
-                    # w: (1, 1, num_samples) torch.Tensor
-                    # m: (1, num_frames) torch.Tensor
-
-        batches = batchify(
-            iter_waveform_and_mask(),
-            batch_size=self.embedding_batch_size,
-            fillvalue=(None, None),
+        supports_speaker_weights = bool(
+            getattr(self._embedding, "supports_speaker_weights", False)
         )
 
-        batch_count = math.ceil(num_chunks * num_speakers / self.embedding_batch_size)
+        if supports_speaker_weights:
+            # Fast path: extract all per-chunk speaker embeddings in one forward pass
+            # by passing weights shaped (batch, speakers, frames).
+            def iter_waveform_and_weights():
+                for (chunk, masks), (_, clean_masks) in zip(
+                    binary_segmentations, clean_segmentations
+                ):
+                    waveform, _ = self._audio.crop(file, chunk, mode="pad")
 
-        embedding_batches = []
+                    masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
+                    clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
 
-        if hook is not None:
-            hook("embeddings", None, total=batch_count, completed=0)
+                    used = []
+                    for mask, clean_mask in zip(masks.T, clean_masks.T):
+                        used_mask = (
+                            clean_mask if np.sum(clean_mask) > min_num_frames else mask
+                        )
+                        used.append(used_mask)
 
-        for i, batch in enumerate(batches, 1):
-            waveforms, masks = zip(*filter(lambda b: b[0] is not None, batch))
+                    weights = torch.from_numpy(np.stack(used, axis=0))[None]
+                    # w: (1, 1, num_samples) torch.Tensor
+                    # m: (1, num_speakers, num_frames) torch.Tensor
+                    yield waveform[None], weights
 
-            waveform_batch = torch.vstack(waveforms)
-            # (batch_size, 1, num_samples) torch.Tensor
-
-            mask_batch = torch.vstack(masks)
-            # (batch_size, num_frames) torch.Tensor
-
-            embedding_batch: np.ndarray = self._embedding(
-                waveform_batch, masks=mask_batch
+            batches = batchify(
+                iter_waveform_and_weights(),
+                batch_size=self.embedding_batch_size,
+                fillvalue=(None, None),
             )
-            # (batch_size, dimension) np.ndarray
-
-            embedding_batches.append(embedding_batch)
+            batch_count = math.ceil(num_chunks / self.embedding_batch_size)
+            embedding_batches: list[np.ndarray] = []
 
             if hook is not None:
-                hook("embeddings", embedding_batch, total=batch_count, completed=i)
+                hook("embeddings", None, total=batch_count, completed=0)
 
-        embedding_batches = np.vstack(embedding_batches)
+            for i, batch in enumerate(batches, 1):
+                kept = [b for b in batch if b[0] is not None]
+                if len(kept) == 0:
+                    continue
 
-        embeddings = rearrange(embedding_batches, "(c s) d -> c s d", c=num_chunks)
+                waveforms, weights = zip(*kept)
+                waveform_batch = torch.vstack(waveforms)
+                weight_batch = torch.vstack(weights)
+                actual_bs = waveform_batch.shape[0]
+
+                # Pad last batch to keep static shapes for JIT/pmap compilation.
+                if actual_bs < self.embedding_batch_size:
+                    pad = self.embedding_batch_size - actual_bs
+                    waveform_batch = torch.cat(
+                        [
+                            waveform_batch,
+                            waveform_batch.new_zeros((pad,) + waveform_batch.shape[1:]),
+                        ],
+                        dim=0,
+                    )
+                    weight_batch = torch.cat(
+                        [
+                            weight_batch,
+                            weight_batch.new_zeros((pad,) + weight_batch.shape[1:]),
+                        ],
+                        dim=0,
+                    )
+
+                embedding_batch: np.ndarray = self._embedding(
+                    waveform_batch, masks=weight_batch
+                )
+                # (batch, num_speakers, dimension)
+                embedding_batch = embedding_batch[:actual_bs]
+                embedding_batches.append(embedding_batch)
+
+                if hook is not None:
+                    hook("embeddings", embedding_batch, total=batch_count, completed=i)
+
+            embeddings = (
+                np.concatenate(embedding_batches, axis=0)
+                if embedding_batches
+                else np.zeros((0, num_speakers, self._embedding.dimension))
+            )
+
+        else:
+            # Fallback: one forward pass per (chunk, speaker) pair.
+            def iter_waveform_and_mask():
+                for (chunk, masks), (_, clean_masks) in zip(
+                    binary_segmentations, clean_segmentations
+                ):
+                    waveform, _ = self._audio.crop(file, chunk, mode="pad")
+
+                    masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
+                    clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
+
+                    for mask, clean_mask in zip(masks.T, clean_masks.T):
+                        used_mask = (
+                            clean_mask if np.sum(clean_mask) > min_num_frames else mask
+                        )
+                        yield waveform[None], torch.from_numpy(used_mask)[None]
+
+            batches = batchify(
+                iter_waveform_and_mask(),
+                batch_size=self.embedding_batch_size,
+                fillvalue=(None, None),
+            )
+            batch_count = math.ceil(num_chunks * num_speakers / self.embedding_batch_size)
+            embedding_batches: list[np.ndarray] = []
+
+            if hook is not None:
+                hook("embeddings", None, total=batch_count, completed=0)
+
+            for i, batch in enumerate(batches, 1):
+                kept = [b for b in batch if b[0] is not None]
+                if len(kept) == 0:
+                    continue
+
+                waveforms, masks = zip(*kept)
+                waveform_batch = torch.vstack(waveforms)
+                mask_batch = torch.vstack(masks)
+                actual_bs = waveform_batch.shape[0]
+
+                # Pad last batch to keep static shapes for JIT/pmap compilation.
+                if actual_bs < self.embedding_batch_size:
+                    pad = self.embedding_batch_size - actual_bs
+                    waveform_batch = torch.cat(
+                        [
+                            waveform_batch,
+                            waveform_batch.new_zeros((pad,) + waveform_batch.shape[1:]),
+                        ],
+                        dim=0,
+                    )
+                    mask_batch = torch.cat(
+                        [
+                            mask_batch,
+                            mask_batch.new_zeros((pad,) + mask_batch.shape[1:]),
+                        ],
+                        dim=0,
+                    )
+
+                embedding_batch: np.ndarray = self._embedding(
+                    waveform_batch, masks=mask_batch
+                )
+                embedding_batch = embedding_batch[:actual_bs]
+                embedding_batches.append(embedding_batch)
+
+                if hook is not None:
+                    hook("embeddings", embedding_batch, total=batch_count, completed=i)
+
+            embedding_batches_2d = np.vstack(embedding_batches)
+            embeddings = rearrange(
+                embedding_batches_2d, "(c s) d -> c s d", c=num_chunks
+            )
 
         # caching embeddings for subsequent trials
         # (see comments at the top of this method for more details)

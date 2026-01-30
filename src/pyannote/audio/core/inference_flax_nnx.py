@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+import math
 from typing import Any, Callable, Optional, Tuple
 
 import numpy as np
@@ -139,6 +140,74 @@ def parse_jax_device(device: Any | None) -> jax.Device | None:
         return None
 
 
+def parse_jax_devices(device: Any | None) -> list[jax.Device]:
+    """Best-effort parsing of a device spec into a list of *local* `jax.Device`.
+
+    This is mostly meant for data parallel inference (`pmap`) where we want all
+    available devices for a given backend.
+    """
+
+    if device is None:
+        return list(jax.local_devices())
+
+    if isinstance(device, jax.Device):
+        return [device]
+
+    if isinstance(device, torch.device):
+        if device.type == "cpu":
+            backend = "cpu"
+        elif device.type == "cuda":
+            backend = "gpu"
+        elif device.type in ("xla", "tpu"):
+            backend = "tpu"
+        else:
+            return list(jax.local_devices())
+
+        try:
+            devs = list(jax.local_devices(backend=backend))
+        except Exception:
+            return list(jax.local_devices())
+
+        if device.index is None:
+            return devs
+
+        try:
+            return [devs[device.index]]
+        except Exception:
+            return devs
+
+    if not isinstance(device, str):
+        raise TypeError(
+            f"Unsupported JAX device specification type: {type(device).__name__}. "
+            "Expected `jax.Device`, `torch.device`, `str`, or `None`."
+        )
+
+    backend, index = _parse_backend_index(device)
+    if backend in ("", "auto", "default"):
+        return list(jax.local_devices())
+
+    if backend == "cuda":
+        backend = "gpu"
+
+    if backend not in ("cpu", "gpu", "tpu"):
+        raise ValueError(
+            f"Unsupported JAX backend {backend!r}. Expected one of 'cpu', 'gpu', 'tpu', or 'auto'."
+        )
+
+    try:
+        devs = list(jax.local_devices(backend=backend))
+    except Exception:
+        return list(jax.local_devices())
+
+    if index is None:
+        return devs
+
+    try:
+        return [devs[index]]
+    except Exception:
+        return devs
+
+
 @dataclass(frozen=True)
 class FlaxNNXSlidingConfig:
     """Configuration for Flax NNX sliding-window inference."""
@@ -170,6 +239,7 @@ class FlaxNNXSlidingInference(BaseInference):
         powerset_mapping: np.ndarray | None = None,
         jax_device: Any | None = None,
         jit: bool = True,
+        data_parallel: bool = False,
     ):
         super().__init__()
         self.model = model
@@ -181,6 +251,19 @@ class FlaxNNXSlidingInference(BaseInference):
             raise ValueError("`batch_size` must be >= 1.")
 
         self.jax_device = parse_jax_device(jax_device)
+        self.data_parallel = bool(data_parallel)
+        self._dp_devices: list[jax.Device] | None = None
+        self._dp_devices_count = 1
+        if self.data_parallel:
+            dp_devices = parse_jax_devices(jax_device)
+            if len(dp_devices) > 1:
+                self._dp_devices = dp_devices
+                self._dp_devices_count = len(dp_devices)
+                if self.batch_size % self._dp_devices_count != 0:
+                    self.batch_size = int(
+                        math.ceil(self.batch_size / self._dp_devices_count)
+                        * self._dp_devices_count
+                    )
 
         mapping = None
         if powerset_mapping is not None:
@@ -195,7 +278,21 @@ class FlaxNNXSlidingInference(BaseInference):
             idx = jnp.argmax(y, axis=-1)
             return mapping[idx]
 
-        self._forward = nnx.jit(_forward) if jit else _forward
+        self._forward_fn = _forward
+        self._jit = bool(jit)
+        self._rebuild_forward()
+
+    def _rebuild_forward(self) -> None:
+        if self._dp_devices is not None:
+            self._forward = nnx.pmap(
+                self._forward_fn,
+                axis_name="data",
+                in_axes=(None, 0),
+                out_axes=0,
+                devices=self._dp_devices,
+            )
+        else:
+            self._forward = nnx.jit(self._forward_fn) if self._jit else self._forward_fn
 
     def to(self, device: torch.device | str | None) -> "FlaxNNXSlidingInference":
         # Keep a torch-like `.to(...)` so `Pipeline.to(...)` can propagate device
@@ -203,10 +300,38 @@ class FlaxNNXSlidingInference(BaseInference):
         # JAX default device placement.
         if isinstance(device, str):
             self.jax_device = parse_jax_device(device)
+            if self.data_parallel:
+                dp_devices = parse_jax_devices(device)
+                if len(dp_devices) > 1:
+                    self._dp_devices = dp_devices
+                    self._dp_devices_count = len(dp_devices)
+                    if self.batch_size % self._dp_devices_count != 0:
+                        self.batch_size = int(
+                            math.ceil(self.batch_size / self._dp_devices_count)
+                            * self._dp_devices_count
+                        )
+                else:
+                    self._dp_devices = None
+                    self._dp_devices_count = 1
+                self._rebuild_forward()
             return self
 
         if device is None:
             self.jax_device = None
+            if self.data_parallel:
+                dp_devices = parse_jax_devices(None)
+                if len(dp_devices) > 1:
+                    self._dp_devices = dp_devices
+                    self._dp_devices_count = len(dp_devices)
+                    if self.batch_size % self._dp_devices_count != 0:
+                        self.batch_size = int(
+                            math.ceil(self.batch_size / self._dp_devices_count)
+                            * self._dp_devices_count
+                        )
+                else:
+                    self._dp_devices = None
+                    self._dp_devices_count = 1
+                self._rebuild_forward()
             return self
 
         if not isinstance(device, torch.device):
@@ -215,6 +340,20 @@ class FlaxNNXSlidingInference(BaseInference):
             )
 
         self.jax_device = parse_jax_device(device)
+        if self.data_parallel:
+            dp_devices = parse_jax_devices(device)
+            if len(dp_devices) > 1:
+                self._dp_devices = dp_devices
+                self._dp_devices_count = len(dp_devices)
+                if self.batch_size % self._dp_devices_count != 0:
+                    self.batch_size = int(
+                        math.ceil(self.batch_size / self._dp_devices_count)
+                        * self._dp_devices_count
+                    )
+            else:
+                self._dp_devices = None
+                self._dp_devices_count = 1
+            self._rebuild_forward()
         return self
 
     def __call__(
@@ -268,6 +407,7 @@ class FlaxNNXSlidingInference(BaseInference):
 
         outputs: list[np.ndarray] = []
         bs = self.batch_size
+        dp_count = self._dp_devices_count
 
         for start in range(0, total, bs):
             batch = chunks[start : start + bs]
@@ -279,11 +419,17 @@ class FlaxNNXSlidingInference(BaseInference):
                 batch = torch.cat([batch, pad], dim=0)
 
             x = jnp.asarray(np.asarray(batch.numpy()))
-            if self.jax_device is not None:
+            if self._dp_devices is not None:
+                # (B, C, T) -> (D, B/D, C, T)
+                x = x.reshape(dp_count, bs // dp_count, x.shape[1], x.shape[2])
+            elif self.jax_device is not None:
                 x = jax.device_put(x, self.jax_device)
 
             y = self._forward(self.model, x)
-            y_np = np.asarray(jax.device_get(y))[:actual_bs]
+            y_np_full = np.asarray(jax.device_get(y))
+            if self._dp_devices is not None:
+                y_np_full = y_np_full.reshape((bs,) + y_np_full.shape[2:])
+            y_np = y_np_full[:actual_bs]
             outputs.append(y_np)
 
             if hook is not None:
@@ -292,4 +438,3 @@ class FlaxNNXSlidingInference(BaseInference):
         data = np.concatenate(outputs, axis=0) if outputs else np.zeros((0, 0, 0), dtype=np.float32)
         frames = SlidingWindow(start=0.0, duration=self.duration, step=self.step)
         return SlidingWindowFeature(data, frames)
-

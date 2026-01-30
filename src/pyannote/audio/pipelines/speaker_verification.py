@@ -686,6 +686,22 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         return "cosine"
 
     @cached_property
+    def supports_speaker_weights(self) -> bool:
+        """Whether `masks` can be provided with a speaker dimension.
+
+        In speaker diarization, using weights shaped (batch, speakers, frames)
+        allows extracting all per-chunk speaker embeddings in one forward pass,
+        which is significantly faster than running one forward per speaker.
+        """
+
+        try:
+            from pyannote.audio.models.embedding.wespeaker import BaseWeSpeakerResNet
+        except Exception:
+            return False
+
+        return isinstance(self.model_, BaseWeSpeakerResNet)
+
+    @cached_property
     def min_num_samples(self) -> int:
         with torch.inference_mode():
             lower, upper = 2, round(0.5 * self.sample_rate)
