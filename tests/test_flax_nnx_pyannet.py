@@ -13,8 +13,9 @@ pytestmark = pytest.mark.skipif(
 
 def test_pyannet_torch_to_flax_nnx():
     token = os.getenv("HF_TOKEN")
-    if not token:
-        pytest.skip("HF_TOKEN is not set")
+    offline = os.getenv("HF_HUB_OFFLINE") == "1"
+    if not token and not offline:
+        pytest.skip("HF_TOKEN is not set (set HF_HUB_OFFLINE=1 to use cached artifacts)")
 
     try:
         import jax.numpy as jnp
@@ -41,4 +42,3 @@ def test_pyannet_torch_to_flax_nnx():
 
     assert flax_out.shape == torch_out.shape
     np.testing.assert_allclose(np.asarray(flax_out), torch_out, rtol=1e-3, atol=1e-3)
-

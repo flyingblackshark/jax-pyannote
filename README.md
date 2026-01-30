@@ -251,11 +251,13 @@ Some tests download models from the Hugging Face Hub and/or require access to ga
 ```bash
 export PYANNOTE_E2E=1
 export HF_TOKEN=...   # do not commit tokens
+export HF_HUB_OFFLINE=1  # optional: use cached artifacts only (no network)
 
 pytest -q \
   tests/test_flax_nnx_wespeaker.py \
   tests/test_flax_nnx_pyannet.py \
-  tests/test_hf_speaker_diarization_community1.py
+  tests/test_hf_speaker_diarization_community1.py \
+  tests/test_flax_nnx_pipeline_speaker_diarization.py
 ```
 
 ### Flax NNX (experimental)
@@ -264,6 +266,35 @@ This repository includes experimental Flax NNX ports + PyTorch-to-NNX weight con
 
 - `pyannote/wespeaker-voxceleb-resnet34-LM` (WeSpeaker ResNet34 backbone; expects fbank features)
 - `pyannote/speaker-diarization-community-1` segmentation model (PyanNet; waveform -> frame-wise log-probabilities)
+
+The `SpeakerDiarization` pipeline also includes an experimental Flax NNX backend:
+
+```python
+from pyannote.audio.pipelines import SpeakerDiarization
+
+pipeline = SpeakerDiarization(
+    backend="flax_nnx",  # or "jax"
+    jax_device="cpu",    # optional: "cpu", "gpu", "tpu", "tpu:0", ...
+    jax_jit=True,        # optional: disable for debugging
+    token="HUGGINGFACE_ACCESS_TOKEN",
+)
+
+output = pipeline("audio.wav")
+```
+
+You can also override the backend per component:
+
+```python
+pipeline = SpeakerDiarization(
+    segmentation={"checkpoint": "pyannote/speaker-diarization-community-1", "subfolder": "segmentation", "backend": "flax_nnx"},
+    embedding={"checkpoint": "pyannote/wespeaker-voxceleb-resnet34-LM", "backend": "flax_nnx"},
+)
+```
+
+Notes:
+- The Flax NNX pipeline backend converts PyTorch checkpoints at runtime (first run is slower).
+- For true TPU execution with JAX, you need a TPU-enabled `jaxlib` + `libtpu` runtime.
+- The current WeSpeaker Flax NNX path reuses PyTorch/torchaudio fbank extraction on CPU.
 
 Install optional dependencies:
 
@@ -278,4 +309,13 @@ export PYANNOTE_E2E=1
 export HF_TOKEN=...
 
 pytest -q tests/test_flax_nnx_wespeaker.py tests/test_flax_nnx_pyannet.py
+```
+
+### TPU / XLA notes (PyTorch)
+
+When running on a TPU runtime via `torch_xla`, you can try enabling deferred CPU transfers to
+reduce host/device synchronization overhead:
+
+```bash
+export PYANNOTE_XLA_DEFER_CPU_TRANSFER=1
 ```

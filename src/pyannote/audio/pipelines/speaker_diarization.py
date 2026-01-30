@@ -163,6 +163,15 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         Huggingface token to be used for downloading from Huggingface hub.
     cache_dir: Path or str, optional
         Path to the folder where files downloaded from Huggingface hub are stored.
+    backend : {"torch", "jax", "flax_nnx"}, optional
+        Experimental backend selector.
+        Defaults to "torch" (PyTorch). Use "jax" or "flax_nnx" to run segmentation
+        and embedding with Flax NNX ports.
+    jax_device : str, optional
+        Optional JAX device hint ("cpu", "gpu", "tpu", optionally with ":N").
+        When not set, relies on JAX default device placement.
+    jax_jit : bool, optional
+        Whether to JIT-compile Flax NNX inference functions. Defaults to True.
         
     Usage
     -----
@@ -213,19 +222,28 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         der_variant: Optional[dict] = None,
         token: Union[Text, None] = None,
         cache_dir: Union[Path, Text, None] = None,
+        backend: str = "torch",
+        jax_device: str | None = None,
+        jax_jit: bool = True,
     ):
         super().__init__()
 
         self.legacy = legacy
+        self.backend = backend
 
         self.segmentation_model = segmentation
-        model: Model = get_model(segmentation, token=token, cache_dir=cache_dir)
+        segmentation_backend = backend
+        if isinstance(segmentation, Mapping) and "backend" in segmentation:
+            segmentation_backend = str(segmentation.get("backend"))
 
         self.segmentation_step = segmentation_step
 
         self.embedding = embedding
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
+        embedding_backend = backend
+        if isinstance(embedding, Mapping) and "backend" in embedding:
+            embedding_backend = str(embedding.get("backend"))
 
         self.plda = plda
         self._plda = get_plda(plda, token=token, cache_dir=cache_dir)
@@ -234,16 +252,71 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
 
         self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
 
-        segmentation_duration = model.specifications.duration
-        self._segmentation = Inference(
-            model,
-            duration=segmentation_duration,
-            step=self.segmentation_step * segmentation_duration,
-            skip_aggregation=True,
-            batch_size=segmentation_batch_size,
-        )
+        def _strip_backend(spec: PipelineModel) -> PipelineModel:
+            # Allow users to pass e.g. {"checkpoint": ..., "subfolder": ..., "backend": "flax_nnx"}.
+            if isinstance(spec, Mapping) and "backend" in spec:
+                stripped = dict(spec)
+                stripped.pop("backend", None)
+                stripped.pop("jax_device", None)
+                stripped.pop("jit", None)
+                return stripped
+            return spec
 
-        if self._segmentation.model.specifications.powerset:
+        if segmentation_backend.lower() in ("jax", "flax_nnx"):
+            # Load PyTorch checkpoint for metadata + weight conversion.
+            model: Model = get_model(
+                _strip_backend(segmentation), token=token, cache_dir=cache_dir
+            )
+
+            from pyannote.audio.core.inference_flax_nnx import (
+                FlaxNNXSlidingConfig,
+                FlaxNNXSlidingInference,
+                build_powerset_mapping,
+            )
+            from pyannote.audio.models.segmentation.flax_nnx import pyannet_from_torch
+
+            flax_pyannet = pyannet_from_torch(model)
+
+            powerset_mapping = None
+            if model.specifications.powerset:
+                powerset_mapping = build_powerset_mapping(
+                    num_classes=len(model.specifications.classes),
+                    max_set_size=model.specifications.powerset_max_classes,
+                )
+
+            segmentation_duration = model.specifications.duration
+            self._segmentation = FlaxNNXSlidingInference(
+                flax_pyannet,
+                audio=model.audio,
+                config=FlaxNNXSlidingConfig(
+                    duration=segmentation_duration,
+                    step=self.segmentation_step * segmentation_duration,
+                    batch_size=segmentation_batch_size,
+                ),
+                powerset_mapping=powerset_mapping,
+                jax_device=jax_device,
+                jit=jax_jit,
+            )
+
+        else:
+            model: Model = get_model(
+                _strip_backend(segmentation), token=token, cache_dir=cache_dir
+            )
+
+            segmentation_duration = model.specifications.duration
+            self._segmentation = Inference(
+                model,
+                duration=segmentation_duration,
+                step=self.segmentation_step * segmentation_duration,
+                skip_aggregation=True,
+                batch_size=segmentation_batch_size,
+            )
+
+        # keep PyTorch metadata around for downstream logic, regardless of backend
+        self._segmentation_specifications = model.specifications
+        self._segmentation_receptive_field = model.receptive_field
+
+        if self._segmentation_specifications.powerset:
             self.segmentation = ParamDict(
                 min_duration_off=Uniform(0.0, 1.0),
             )
@@ -258,9 +331,22 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             metric = "not_applicable"
 
         else:
-            self._embedding = PretrainedSpeakerEmbedding(
-                self.embedding, token=token, cache_dir=cache_dir
-            )
+            if embedding_backend.lower() in ("jax", "flax_nnx"):
+                from pyannote.audio.pipelines.speaker_verification_flax_nnx import (
+                    FlaxNNXWeSpeakerPretrainedSpeakerEmbedding,
+                )
+
+                self._embedding = FlaxNNXWeSpeakerPretrainedSpeakerEmbedding(
+                    _strip_backend(self.embedding),
+                    token=token,
+                    cache_dir=cache_dir,
+                    jax_device=jax_device,
+                    jit=jax_jit,
+                )
+            else:
+                self._embedding = PretrainedSpeakerEmbedding(
+                    _strip_backend(self.embedding), token=token, cache_dir=cache_dir
+                )
             self._audio = Audio(sample_rate=self._embedding.sample_rate, mono="downmix")
             metric = self._embedding.metric
 
@@ -364,7 +450,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             # `powerset` mode
             cache = file.get("training_cache/embeddings", dict())
             if ("embeddings" in cache) and (
-                self._segmentation.model.specifications.powerset
+                self._segmentation_specifications.powerset
                 or (cache["segmentation.threshold"] == self.segmentation.threshold)
             ):
                 return cache["embeddings"]
@@ -465,7 +551,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         # caching embeddings for subsequent trials
         # (see comments at the top of this method for more details)
         if self.training:
-            if self._segmentation.model.specifications.powerset:
+            if self._segmentation_specifications.powerset:
                 file["training_cache/embeddings"] = {
                     "embeddings": embeddings,
                 }
@@ -596,7 +682,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         num_chunks, num_frames, local_num_speakers = segmentations.data.shape
 
         # binarize segmentation
-        if self._segmentation.model.specifications.powerset:
+        if self._segmentation_specifications.powerset:
             binarized_segmentations = segmentations
         else:
             binarized_segmentations: SlidingWindowFeature = binarize(
@@ -608,7 +694,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         # estimate frame-level number of instantaneous speakers
         count = self.speaker_count(
             binarized_segmentations,
-            self._segmentation.model.receptive_field,
+            self._segmentation_receptive_field,
             warm_up=(0.0, 0.0),
         )
         hook("speaker_counting", count)
@@ -644,7 +730,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             min_clusters=min_speakers,
             max_clusters=max_speakers,
             file=file,  # <== for oracle clustering
-            frames=self._segmentation.model.receptive_field,  # <== for oracle clustering
+            frames=self._segmentation_receptive_field,  # <== for oracle clustering
         )
         # hard_clusters: (num_chunks, num_speakers)
         # centroids: (num_speakers, dimension)

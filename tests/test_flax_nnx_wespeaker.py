@@ -12,6 +12,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_wespeaker_resnet34_torch_to_flax_nnx():
+    token = os.getenv("HF_TOKEN")
+
     try:
         import jax.numpy as jnp
     except Exception:
@@ -23,7 +25,7 @@ def test_wespeaker_resnet34_torch_to_flax_nnx():
     except Exception as e:
         pytest.skip(str(e))
 
-    model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM")
+    model = Model.from_pretrained("pyannote/wespeaker-voxceleb-resnet34-LM", token=token)
     torch_resnet = model.resnet.eval()
 
     # Random fbank input (batch, frames, features)
@@ -37,4 +39,3 @@ def test_wespeaker_resnet34_torch_to_flax_nnx():
 
     assert flax_out.shape == torch_out.shape
     np.testing.assert_allclose(np.asarray(flax_out), torch_out, rtol=2e-4, atol=2e-4)
-
