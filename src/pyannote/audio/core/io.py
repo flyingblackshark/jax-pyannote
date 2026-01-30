@@ -30,6 +30,7 @@ pyannote.audio relies on torchcodec for reading and torchaudio for resampling.
 
 import random
 import warnings
+from dataclasses import dataclass
 from io import IOBase
 from pathlib import Path
 from typing import Mapping, Optional, Tuple
@@ -43,6 +44,7 @@ try:
     import torchcodec
     from torchcodec import AudioSamples
     from torchcodec.decoders import AudioDecoder, AudioStreamMetadata
+    TORCHCODEC_AVAILABLE = True
 except Exception as e:
     warnings.warn(
         "\ntorchcodec is not installed correctly so built-in audio decoding will fail. Solutions are:\n"
@@ -50,6 +52,19 @@ except Exception as e:
         "* fix torchcodec installation. Error message was:\n\n"
         f"{e}"
     )
+    TORCHCODEC_AVAILABLE = False
+    torchcodec = None  # type: ignore[assignment]
+    AudioDecoder = None  # type: ignore[assignment, misc]
+    AudioSamples = None  # type: ignore[assignment, misc]
+    AudioStreamMetadata = None  # type: ignore[assignment, misc]
+
+
+@dataclass(frozen=True)
+class _AudioStreamMetadataFallback:
+    """Minimal subset of torchcodec's AudioStreamMetadata used by this module."""
+
+    sample_rate: int
+    duration_seconds_from_header: float
 
 
 AudioFile = str | Path | IOBase | Mapping
@@ -83,7 +98,25 @@ def get_audio_metadata(file: AudioFile) -> "AudioStreamMetadata":
         Audio file metadata
     """
 
-    metadata = AudioDecoder(file["audio"]).metadata
+    # Prefer torchcodec when available. Fall back to torchaudio metadata otherwise.
+    if TORCHCODEC_AVAILABLE:
+        metadata = AudioDecoder(file["audio"]).metadata
+
+    else:
+        # torchaudio.info does not support all file-like objects. For streams,
+        # load the whole waveform to infer metadata.
+        if isinstance(file["audio"], IOBase):
+            waveform, sample_rate = torchaudio.load(file["audio"])
+            metadata = _AudioStreamMetadataFallback(
+                sample_rate=sample_rate,
+                duration_seconds_from_header=waveform.shape[1] / sample_rate,
+            )
+        else:
+            info = torchaudio.info(str(file["audio"]))
+            metadata = _AudioStreamMetadataFallback(
+                sample_rate=info.sample_rate,
+                duration_seconds_from_header=info.num_frames / info.sample_rate,
+            )
 
     # rewind if needed
     if isinstance(file["audio"], IOBase):
@@ -270,8 +303,7 @@ class Audio:
             sample_rate = file["sample_rate"]
             return frames / sample_rate
 
-        metadata: AudioStreamMetadata = get_audio_metadata(file)
-
+        metadata = get_audio_metadata(file)
         return metadata.duration_seconds_from_header
 
     def get_num_samples(
@@ -316,11 +348,15 @@ class Audio:
 
             return self.downmix_and_resample(waveform, sample_rate, channel=channel)
 
-        decoder = AudioDecoder(file["audio"])
-        samples: AudioSamples = decoder.get_all_samples()
+        if TORCHCODEC_AVAILABLE:
+            decoder = AudioDecoder(file["audio"])
+            samples: AudioSamples = decoder.get_all_samples()
 
-        waveform = samples.data
-        sample_rate = samples.sample_rate
+            waveform = samples.data
+            sample_rate = samples.sample_rate
+
+        else:
+            waveform, sample_rate = torchaudio.load(file["audio"])
 
         # rewind if needed
         if isinstance(file["audio"], IOBase):
@@ -390,6 +426,22 @@ class Audio:
             data = waveform[:, start_sample:end_sample]
             data = F.pad(data, (pad_start, pad_end))
             return self.downmix_and_resample(data, sample_rate, channel=channel)
+
+        # Fallback: load the full waveform and reuse the in-memory cropping logic.
+        if not TORCHCODEC_AVAILABLE:
+            waveform, sample_rate = torchaudio.load(file["audio"])
+            if isinstance(file["audio"], IOBase):
+                file["audio"].seek(0)
+            return self.crop(
+                {
+                    "waveform": waveform,
+                    "sample_rate": sample_rate,
+                    "channel": channel,
+                    "uri": file.get("uri", "audio"),
+                },
+                segment,
+                mode=mode,
+            )
 
         decoder = AudioDecoder(file["audio"])
 

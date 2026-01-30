@@ -41,6 +41,7 @@ import torch
 import typer
 import yaml
 from pyannote.audio import Audio, Model, Pipeline
+from pyannote.audio.utils.device import parse_device as parse_torch_device
 from pyannote.core import Annotation
 from pyannote.metrics.base import BaseMetric
 from pyannote.metrics.diarization import DiarizationErrorRate, JaccardErrorRate
@@ -60,6 +61,8 @@ class Device(str, Enum):
     CPU = "cpu"
     CUDA = "cuda"
     MPS = "mps"
+    XLA = "xla"
+    TPU = "tpu"
     AUTO = "auto"
 
 
@@ -83,17 +86,7 @@ class Metric(str, Enum):
 
 
 def parse_device(device: Device) -> torch.device:
-    if device == Device.AUTO:
-        if torch.cuda.is_available():
-            device = Device.CUDA
-
-        elif torch.backends.mps.is_available():
-            device = Device.MPS
-
-        else:
-            device = Device.CPU
-
-    return torch.device(device.value)
+    return parse_torch_device(device.value)
 
 
 def get_diarization(prediction) -> Annotation:
@@ -136,7 +129,7 @@ def optimize(
         ),
     ] = Subset.development,
     device: Annotated[
-        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS, XLA/TPU)")
     ] = Device.AUTO,
     registry: Annotated[
         Optional[Path],
@@ -371,7 +364,7 @@ def apply(
         ),
     ] = None,
     device: Annotated[
-        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS, XLA/TPU)")
     ] = Device.AUTO,
 ):
     """
@@ -557,7 +550,7 @@ def benchmark(
         ),
     ] = None,
     device: Annotated[
-        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS)")
+        Device, typer.Option(help="Accelerator to use (CPU, CUDA, MPS, XLA/TPU)")
     ] = Device.AUTO,
     registry: Annotated[
         Optional[Path],

@@ -1,5 +1,5 @@
 import torch
-from torchcodec.decoders import AudioDecoder, AudioStreamMetadata
+import torchaudio
 
 from pyannote.core import Segment
 from torch import Tensor
@@ -10,8 +10,7 @@ from pyannote.audio.core.io import Audio
 def test_audio_resample():
     "Audio is correctly resampled when it isn't the correct sample rate"
     test_file = "tests/data/dev00.wav"
-    metadata: AudioStreamMetadata = AudioDecoder(test_file).metadata
-    old_sr = metadata.sample_rate
+    old_sr = torchaudio.info(test_file).sample_rate
     loader = Audio(sample_rate=old_sr // 2, mono="downmix")
     wav, sr = loader(test_file)
     assert isinstance(wav, Tensor)

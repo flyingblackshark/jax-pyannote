@@ -295,6 +295,34 @@ def get_devices(needs: int | None = None):
     num_gpus = torch.cuda.device_count()
 
     if num_gpus == 0:
+        # Prefer TPU when available (torch_xla on a TPU runtime).
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+
+            xla_device = xm.xla_device()
+            hw = None
+            try:
+                hw = xm.xla_device_hw(xla_device)  # type: ignore[attr-defined]
+            except Exception:
+                hw = None
+
+            if hw == "TPU":
+                try:
+                    device_strings = xm.get_xla_supported_devices()  # type: ignore[attr-defined]
+                    devices = [torch.device(d) for d in device_strings]
+                except Exception:
+                    devices = [xla_device]
+
+                if needs is None:
+                    return devices
+                return [
+                    device
+                    for _, device in zip(range(needs), itertools.cycle(devices))
+                ]
+
+        except Exception:
+            pass
+
         devices = [torch.device("cpu")]
         if needs is None:
             return devices

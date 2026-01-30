@@ -233,7 +233,7 @@ If you use `pyannote.audio` please use the following citations:
 The commands below will setup pre-commit hooks and packages needed for developing the `pyannote.audio` library.
 
 ```bash
-pip install -e .[dev,testing]
+pip install -e ".[dev,test]"
 pre-commit install
 ```
 
@@ -241,4 +241,41 @@ pre-commit install
 
 ```bash
 pytest
+```
+
+### End-to-end tests (optional)
+
+Some tests download models from the Hugging Face Hub and/or require access to gated repositories
+(e.g. `pyannote/speaker-diarization-community-1`). They are disabled by default.
+
+```bash
+export PYANNOTE_E2E=1
+export HF_TOKEN=...   # do not commit tokens
+
+pytest -q \
+  tests/test_flax_nnx_wespeaker.py \
+  tests/test_flax_nnx_pyannet.py \
+  tests/test_hf_speaker_diarization_community1.py
+```
+
+### Flax NNX (experimental)
+
+This repository includes experimental Flax NNX ports + PyTorch-to-NNX weight converters for:
+
+- `pyannote/wespeaker-voxceleb-resnet34-LM` (WeSpeaker ResNet34 backbone; expects fbank features)
+- `pyannote/speaker-diarization-community-1` segmentation model (PyanNet; waveform -> frame-wise log-probabilities)
+
+Install optional dependencies:
+
+```bash
+pip install -e ".[test,flax]"
+```
+
+Run conversion tests (requires network; `community-1` also requires `HF_TOKEN`):
+
+```bash
+export PYANNOTE_E2E=1
+export HF_TOKEN=...
+
+pytest -q tests/test_flax_nnx_wespeaker.py tests/test_flax_nnx_pyannet.py
 ```

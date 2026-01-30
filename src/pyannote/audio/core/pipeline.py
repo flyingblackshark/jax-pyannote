@@ -39,6 +39,7 @@ from pyannote.audio.core.io import AudioFile
 from pyannote.audio.core.model import Model
 from pyannote.audio.telemetry import track_pipeline_apply, track_pipeline_init
 from pyannote.audio.utils.dependencies import check_dependencies
+from pyannote.audio.utils.device import parse_device
 from pyannote.audio.utils.hf_hub import AssetFileName, download_from_hf_hub
 from pyannote.audio.utils.reproducibility import fix_reproducibility
 from pyannote.core.utils.helper import get_class_by_name
@@ -292,8 +293,8 @@ class Pipeline(_Pipeline):
 
         # send pipeline to specified device
         if "device" in config:
-            device = torch.device(config["device"])
             try:
+                device = parse_device(config["device"])
                 pipeline.to(device)
             except RuntimeError as e:
                 print(e)
@@ -477,13 +478,10 @@ class Pipeline(_Pipeline):
 
         return self.apply(file, **kwargs)
 
-    def to(self, device: torch.device) -> Pipeline:
+    def to(self, device: torch.device | str) -> Pipeline:
         """Send pipeline to `device`"""
 
-        if not isinstance(device, torch.device):
-            raise TypeError(
-                f"`device` must be an instance of `torch.device`, got `{type(device).__name__}`"
-            )
+        device = parse_device(device)
 
         for _, pipeline in self._pipelines.items():
             if hasattr(pipeline, "to"):
